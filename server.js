@@ -3,6 +3,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const MODEL = process.env.MODEL || 'gpt-realtime';
 const VOICE = process.env.VOICE || 'alloy';
 const PROMPT_URL =
@@ -11,6 +13,14 @@ const PROMPT_URL =
 
 const DEFAULT_PROMPT =
   "You are a friendly phone assistant. As soon as the call connects, greet the caller first by saying: \"Thank you for calling. How can I help?\" Then assist them.";
+
+// The departments the AI can transfer to.
+const DEPARTMENTS = [
+  'Customer Service',
+  'Insurance',
+  'Branch Representative',
+  'Mortgage Payments',
+];
 
 if (!OPENAI_API_KEY) {
   console.error('FATAL: OPENAI_API_KEY env var is not set.');
@@ -29,6 +39,58 @@ async function fetchPrompt() {
   } catch (e) {
     console.error('Prompt fetch failed, using default:', e.message);
     return DEFAULT_PROMPT;
+  }
+}
+
+function xmlEscape(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// --- Twilio REST: redirect the live call to new TwiML (the "transfer") ---
+async function transferCall(callSid, host, department) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    console.error('Cannot transfer: Twilio creds not set.');
+    return;
+  }
+  if (!callSid) {
+    console.error('Cannot transfer: no callSid.');
+    return;
+  }
+
+  const dept = xmlEscape(department);
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>You have been transferred to ${dept}. Redirecting back to the main menu.</Say>
+  <Redirect>https://${host}/voice</Redirect>
+</Response>`;
+
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+  const body = new URLSearchParams({ Twiml: twiml });
+
+  try {
+    const res = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body,
+      }
+    );
+    if (!res.ok) {
+      console.error('Twilio redirect failed:', res.status, await res.text());
+    } else {
+      console.log('Transfer redirect sent for', department);
+    }
+  } catch (e) {
+    console.error('Twilio redirect error:', e.message);
   }
 }
 
@@ -60,14 +122,17 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: '/twilio' });
 
-wss.on('connection', (twilioWs) => {
+wss.on('connection', (twilioWs, req) => {
   console.log('── Twilio WS connected ──');
 
+  const host = req.headers.host; // used to build the /voice redirect URL
   let streamSid = null;
+  let callSid = null;
   let openaiWs = null;
-  let sessionReady = false; // true after session.updated (audio formats locked in)
+  let sessionReady = false;
   let greeted = false;
-  const audioQueue = []; // caller audio captured before OpenAI is ready
+  let transferring = false;
+  const audioQueue = [];
 
   // 1) Open the OpenAI Realtime socket for this call
   (async () => {
@@ -75,7 +140,7 @@ wss.on('connection', (twilioWs) => {
 
     openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${MODEL}`, {
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
     });
 
@@ -90,7 +155,6 @@ wss.on('connection', (twilioWs) => {
       }
 
       switch (msg.type) {
-        // Configure the session: g711 µ-law both ways (pure passthrough with Twilio)
         case 'session.created': {
           openaiWs.send(
             JSON.stringify({
@@ -98,9 +162,29 @@ wss.on('connection', (twilioWs) => {
               session: {
                 type: 'realtime',
                 instructions,
+                tools: [
+                  {
+                    type: 'function',
+                    name: 'transfer_call',
+                    description:
+                      'Transfer the caller to a department. Call this as soon as the caller asks to be transferred, or when their request clearly belongs to one of the departments.',
+                    parameters: {
+                      type: 'object',
+                      properties: {
+                        department: {
+                          type: 'string',
+                          enum: DEPARTMENTS,
+                          description: 'Which department to transfer the caller to.',
+                        },
+                      },
+                      required: ['department'],
+                    },
+                  },
+                ],
+                tool_choice: 'auto',
                 audio: {
                   input: {
-                    format: { type: 'audio/pcmu' }, // µ-law 8kHz
+                    format: { type: 'audio/pcmu' },
                     turn_detection: {
                       type: 'server_vad',
                       threshold: 0.5,
@@ -109,7 +193,7 @@ wss.on('connection', (twilioWs) => {
                     },
                   },
                   output: {
-                    format: { type: 'audio/pcmu' }, // µ-law 8kHz
+                    format: { type: 'audio/pcmu' },
                     voice: VOICE,
                   },
                 },
@@ -119,20 +203,18 @@ wss.on('connection', (twilioWs) => {
           break;
         }
 
-        // Session is fully configured → safe to send audio and trigger the greeting
         case 'session.updated': {
           if (!sessionReady) {
             sessionReady = true;
             console.log('Session ready');
 
-            // flush any caller audio we buffered while waiting
             for (const a of audioQueue) {
-              openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: a }));
+              openaiWs.send(
+                JSON.stringify({ type: 'input_audio_buffer.append', audio: a })
+              );
             }
             audioQueue.length = 0;
 
-            // GREETING-FIRST: trigger the model to speak. No hardcoded text —
-            // it generates the opening from your SharePoint instructions.
             if (!greeted) {
               greeted = true;
               openaiWs.send(JSON.stringify({ type: 'response.create' }));
@@ -141,9 +223,8 @@ wss.on('connection', (twilioWs) => {
           break;
         }
 
-        // OpenAI speech → relay straight to Twilio (already µ-law base64)
         case 'response.output_audio.delta': {
-          if (streamSid && msg.delta) {
+          if (!transferring && streamSid && msg.delta) {
             twilioWs.send(
               JSON.stringify({
                 event: 'media',
@@ -155,10 +236,30 @@ wss.on('connection', (twilioWs) => {
           break;
         }
 
-        // Caller started talking → barge-in: dump whatever Twilio still has queued
         case 'input_audio_buffer.speech_started': {
-          if (streamSid) {
+          if (!transferring && streamSid) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
+          }
+          break;
+        }
+
+        // The model called a function → handle transfer
+        case 'response.output_item.done': {
+          const item = msg.item;
+          if (item && item.type === 'function_call' && item.name === 'transfer_call') {
+            let department = 'the requested department';
+            try {
+              const args = JSON.parse(item.arguments || '{}');
+              if (args.department) department = args.department;
+            } catch {}
+
+            if (!transferring) {
+              transferring = true;
+              console.log('Transfer requested →', department);
+              // Redirect the live Twilio call. This tears down the stream + session,
+              // speaks the line, then /voice restarts a fresh realtime session.
+              transferCall(callSid, host, department);
+            }
           }
           break;
         }
@@ -195,16 +296,19 @@ wss.on('connection', (twilioWs) => {
 
       case 'start':
         streamSid = msg.start.streamSid;
-        console.log('Twilio: start, streamSid =', streamSid);
+        callSid = msg.start.callSid; // needed for the REST transfer
+        console.log('Twilio: start, streamSid =', streamSid, 'callSid =', callSid);
         break;
 
       case 'media': {
-        const payload = msg.media?.payload; // base64 µ-law 8kHz
+        const payload = msg.media?.payload;
         if (!payload) break;
         if (openaiWs && openaiWs.readyState === WebSocket.OPEN && sessionReady) {
-          openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+          openaiWs.send(
+            JSON.stringify({ type: 'input_audio_buffer.append', audio: payload })
+          );
         } else {
-          if (audioQueue.length < 1000) audioQueue.push(payload); // safety cap
+          if (audioQueue.length < 1000) audioQueue.push(payload);
         }
         break;
       }
@@ -227,4 +331,8 @@ wss.on('connection', (twilioWs) => {
   twilioWs.on('error', (e) => console.error('Twilio WS error:', e.message));
 });
 
-server.listen(PORT, () => console.log('Relay listening on', PORT));
+server.on('upgrade', (req) => {
+  console.log('HTTP upgrade request for:', req.url);
+});
+
+server.listen(PORT, () => console.log('Relay listening on', PORT, '— build OK'));
