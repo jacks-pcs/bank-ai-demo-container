@@ -14,7 +14,6 @@ const PROMPT_URL =
 const DEFAULT_PROMPT =
   "You are a friendly phone assistant. As soon as the call connects, greet the caller first by saying: \"Thank you for calling. How can I help?\" Then assist them.";
 
-// The departments the AI can transfer to.
 const DEPARTMENTS = [
   'Customer Service',
   'Insurance',
@@ -22,12 +21,14 @@ const DEPARTMENTS = [
   'Mortgage Payments',
 ];
 
+// Safety: if Twilio never echoes the mark, transfer anyway after this long.
+const TRANSFER_MARK_TIMEOUT_MS = 8000;
+
 if (!OPENAI_API_KEY) {
   console.error('FATAL: OPENAI_API_KEY env var is not set.');
   process.exit(1);
 }
 
-// --- live prompt fetch (so you can edit SharePoint without redeploying) ---
 async function fetchPrompt() {
   try {
     const res = await fetch(PROMPT_URL, { redirect: 'follow' });
@@ -51,7 +52,6 @@ function xmlEscape(s) {
     .replace(/'/g, '&apos;');
 }
 
-// --- Twilio REST: redirect the live call to new TwiML (the "transfer") ---
 async function transferCall(callSid, host, department) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
     console.error('Cannot transfer: Twilio creds not set.');
@@ -94,7 +94,6 @@ async function transferCall(callSid, host, department) {
   }
 }
 
-// --- TwiML served to Twilio: connect the call's media to this server ---
 const twiml = (host) =>
   `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -125,16 +124,29 @@ const wss = new WebSocketServer({ server, path: '/twilio' });
 wss.on('connection', (twilioWs, req) => {
   console.log('── Twilio WS connected ──');
 
-  const host = req.headers.host; // used to build the /voice redirect URL
+  const host = req.headers.host;
   let streamSid = null;
   let callSid = null;
   let openaiWs = null;
   let sessionReady = false;
   let greeted = false;
   let transferring = false;
+
+  // pending transfer state
+  let pendingDepartment = null; // set when model calls transfer_call
+  let markSent = false;
+  let transferTimer = null;
+
   const audioQueue = [];
 
-  // 1) Open the OpenAI Realtime socket for this call
+  function doTransfer() {
+    if (transferring) return;
+    transferring = true;
+    if (transferTimer) clearTimeout(transferTimer);
+    console.log('Executing transfer →', pendingDepartment);
+    transferCall(callSid, host, pendingDepartment);
+  }
+
   (async () => {
     const instructions = await fetchPrompt();
 
@@ -167,7 +179,7 @@ wss.on('connection', (twilioWs, req) => {
                     type: 'function',
                     name: 'transfer_call',
                     description:
-                      'Transfer the caller to a department. Call this as soon as the caller asks to be transferred, or when their request clearly belongs to one of the departments.',
+                      'Transfer the caller to a department. First tell the caller you are transferring them, then call this function. The system will play the audio fully before transferring.',
                     parameters: {
                       type: 'object',
                       properties: {
@@ -207,14 +219,12 @@ wss.on('connection', (twilioWs, req) => {
           if (!sessionReady) {
             sessionReady = true;
             console.log('Session ready');
-
             for (const a of audioQueue) {
               openaiWs.send(
                 JSON.stringify({ type: 'input_audio_buffer.append', audio: a })
               );
             }
             audioQueue.length = 0;
-
             if (!greeted) {
               greeted = true;
               openaiWs.send(JSON.stringify({ type: 'response.create' }));
@@ -237,28 +247,55 @@ wss.on('connection', (twilioWs, req) => {
         }
 
         case 'input_audio_buffer.speech_started': {
-          if (!transferring && streamSid) {
+          // Don't barge-in/clear if we're mid-transfer-wait.
+          if (!transferring && !pendingDepartment && streamSid) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
           }
           break;
         }
 
-        // The model called a function → handle transfer
+        // Catch the function call (set pending; do NOT transfer yet)
         case 'response.output_item.done': {
           const item = msg.item;
-          if (item && item.type === 'function_call' && item.name === 'transfer_call') {
+          if (
+            item &&
+            item.type === 'function_call' &&
+            item.name === 'transfer_call'
+          ) {
             let department = 'the requested department';
             try {
               const args = JSON.parse(item.arguments || '{}');
               if (args.department) department = args.department;
             } catch {}
+            if (!pendingDepartment) {
+              pendingDepartment = department;
+              console.log('Transfer pending →', department, '(waiting for audio to finish)');
+            }
+          }
+          break;
+        }
 
-            if (!transferring) {
-              transferring = true;
-              console.log('Transfer requested →', department);
-              // Redirect the live Twilio call. This tears down the stream + session,
-              // speaks the line, then /voice restarts a fresh realtime session.
-              transferCall(callSid, host, department);
+        // Response fully generated. If a transfer is pending, mark the audio
+        // stream so we know when Twilio has PLAYED everything.
+        case 'response.done': {
+          if (pendingDepartment && !markSent && !transferring) {
+            markSent = true;
+            if (streamSid) {
+              twilioWs.send(
+                JSON.stringify({
+                  event: 'mark',
+                  streamSid,
+                  mark: { name: 'transfer_ready' },
+                })
+              );
+              console.log('Mark sent, waiting for Twilio playback to finish…');
+              // Safety net if the mark never comes back.
+              transferTimer = setTimeout(() => {
+                console.log('Mark timeout — transferring anyway.');
+                doTransfer();
+              }, TRANSFER_MARK_TIMEOUT_MS);
+            } else {
+              doTransfer();
             }
           }
           break;
@@ -280,7 +317,6 @@ wss.on('connection', (twilioWs, req) => {
     openaiWs.on('error', (e) => console.error('OpenAI WS error:', e.message));
   })();
 
-  // 2) Handle Twilio media-stream frames
   twilioWs.on('message', (raw) => {
     let msg;
     try {
@@ -296,7 +332,7 @@ wss.on('connection', (twilioWs, req) => {
 
       case 'start':
         streamSid = msg.start.streamSid;
-        callSid = msg.start.callSid; // needed for the REST transfer
+        callSid = msg.start.callSid;
         console.log('Twilio: start, streamSid =', streamSid, 'callSid =', callSid);
         break;
 
@@ -313,6 +349,15 @@ wss.on('connection', (twilioWs, req) => {
         break;
       }
 
+      // Twilio echoes our mark once it has PLAYED all audio up to that point.
+      case 'mark': {
+        if (msg.mark?.name === 'transfer_ready' && pendingDepartment) {
+          console.log('Twilio playback finished (mark received) → transferring.');
+          doTransfer();
+        }
+        break;
+      }
+
       case 'stop':
         console.log('Twilio: stop');
         try {
@@ -324,6 +369,7 @@ wss.on('connection', (twilioWs, req) => {
 
   twilioWs.on('close', () => {
     console.log('── Twilio WS closed ──');
+    if (transferTimer) clearTimeout(transferTimer);
     try {
       openaiWs && openaiWs.close();
     } catch {}
